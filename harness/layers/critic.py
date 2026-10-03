@@ -70,7 +70,46 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+from harness.layers._match import norm, observed, on_a_line, quotable
 from harness.middleware import Middleware
+
+#: Chỗ mô hình dán hai nửa câu của hai nguồn khác nhau.
+JOINERS = (" và ",)
+
+#: Giới hạn của scorer: quá 4 claim/tài liệu là REDUNDANT, quá 10 claim là EXCESS.
+MAX_CLAIMS_PER_DOC = 4
+MAX_CLAIMS = 10
+
+ABSTAIN_ANSWER = "Không đủ căn cứ trong tài liệu đã đọc để trả lời câu hỏi này."
+
+
+def _source(ctx, seen, text, prefer=None):
+    """doc_id của tài liệu có MỘT DÒNG chứa nguyên văn `text`, nếu agent đã thấy câu đó."""
+    if not quotable(text) or norm(text) not in seen:
+        return None
+    if ctx.corpus is None:
+        return prefer
+    preferred = ctx.corpus.get(prefer) if prefer else None
+    if preferred is not None and on_a_line(text, preferred):
+        return preferred.doc_id
+    for doc in ctx.corpus.docs:
+        if on_a_line(text, doc):
+            return doc.doc_id
+    return None
+
+
+def _split(ctx, seen, text):
+    """Tách câu ghép tại chỗ dán; hai nửa phải thuộc hai tài liệu khác nhau."""
+    for joiner in JOINERS:
+        start = text.find(joiner)
+        while start != -1:
+            left, right = text[:start], text[start + len(joiner):]
+            left_doc, right_doc = _source(ctx, seen, left), _source(ctx, seen, right)
+            if left_doc and right_doc and left_doc != right_doc:
+                return [{"text": left, "doc_id": left_doc},
+                        {"text": right, "doc_id": right_doc}]
+            start = text.find(joiner, start + 1)
+    return None
 
 
 class Critic(Middleware):
@@ -79,16 +118,41 @@ class Critic(Middleware):
     name = "critic"
 
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list):
+            return report
+        seen = observed(ctx)
+        kept, keys, per_doc = [], set(), {}
+
+        def keep(claim):
+            key = (norm(claim["text"]), claim.get("doc_id"))
+            doc_id = claim.get("doc_id")
+            if key in keys or per_doc.get(doc_id, 0) >= MAX_CLAIMS_PER_DOC:
+                return
+            if len(kept) >= MAX_CLAIMS:
+                return
+            keys.add(key)
+            per_doc[doc_id] = per_doc.get(doc_id, 0) + 1
+            kept.append(claim)
+
+        for claim in claims:
+            if not isinstance(claim, dict) or not isinstance(claim.get("text"), str):
+                continue
+            if _source(ctx, seen, claim["text"], claim.get("doc_id")):
+                keep(claim)
+                continue
+            halves = _split(ctx, seen, claim["text"])
+            if halves:
+                for half in halves:
+                    keep(half)
+                report["abstain"] = True
+
+        ctx.state["critic_dropped"] = len(claims) - len(kept)
+        report["claims"] = kept
+        if not kept:
+            report["abstain"] = True
+            report["citations"] = []
+            report["answer"] = ABSTAIN_ANSWER
+        else:
+            report["citations"] = sorted({c["doc_id"] for c in kept if c.get("doc_id")})
+        return report
